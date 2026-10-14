@@ -3,10 +3,6 @@
 
 const API_BASE = 'https://framecut-subscription-api.onrender.com';
 
-const $ = (id) => document.getElementById(id);
-
-$('year').textContent = new Date().getFullYear();
-
 async function api(path, body) {
   const options = {
     method: body === undefined ? 'GET' : 'POST',
