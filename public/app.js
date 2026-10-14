@@ -1,5 +1,4 @@
 
-
 const API_BASE = 'https://framecut-subscription-api.onrender.com';
 
 const $ = (id) => document.getElementById(id);
@@ -18,15 +17,14 @@ async function api(path, body) {
     options.body = JSON.stringify(body);
   }
 
-  const res = await fetch(`${API_BASE}${path}`, options);
+  const response = await fetch(`${API_BASE}${path}`, options);
+  const data = await response.json().catch(() => ({}));
 
-  const data = await res.json().catch(() => ({}));
-
-  if (!res.ok) {
+  if (!response.ok) {
     throw new Error(
       data.errorMessage ||
       data.error ||
-      `Request failed (${res.status})`
+      `Request failed (${response.status})`
     );
   }
 
@@ -35,17 +33,13 @@ async function api(path, body) {
 
 function showDashboard(data) {
   $('dashboard').classList.remove('hidden');
-
-  $('accountInfo').textContent =
-    `Signed in as ${data.user.email}`;
+  $('accountInfo').textContent = `Signed in as ${data.user.email}`;
 
   const s = data.subscription;
 
   $('subscriptionInfo').textContent = s
     ? `Subscription: ${s.plan} · status: ${s.status}${
-        s.current_period_end
-          ? ' · through ' + s.current_period_end
-          : ''
+        s.current_period_end ? ' · through ' + s.current_period_end : ''
       }`
     : 'No subscription is active yet.';
 
@@ -61,7 +55,6 @@ function showMessage(id, text, bad = false) {
 // REGISTER
 $('registerForm').addEventListener('submit', async (e) => {
   e.preventDefault();
-
   showMessage('registerMsg', 'Creating account…');
 
   try {
@@ -69,7 +62,6 @@ $('registerForm').addEventListener('submit', async (e) => {
       email: $('regEmail').value.trim(),
       password: $('regPassword').value
     });
-
     showDashboard(data);
   } catch (err) {
     showMessage('registerMsg', err.message, true);
@@ -79,7 +71,6 @@ $('registerForm').addEventListener('submit', async (e) => {
 // LOGIN
 $('loginForm').addEventListener('submit', async (e) => {
   e.preventDefault();
-
   showMessage('loginMsg', 'Signing in…');
 
   try {
@@ -87,7 +78,6 @@ $('loginForm').addEventListener('submit', async (e) => {
       email: $('loginEmail').value.trim(),
       password: $('loginPassword').value
     });
-
     showDashboard(data);
   } catch (err) {
     showMessage('loginMsg', err.message, true);
@@ -112,7 +102,7 @@ $('logoutBtn').addEventListener('click', async () => {
   try {
     await api('/api/auth/logout', {});
   } catch (err) {
-    console.error('Logout request failed:', err.message);
+    console.error('Logout failed:', err.message);
   }
 
   $('dashboard').classList.add('hidden');
@@ -127,7 +117,6 @@ $('tokenBtn').addEventListener('click', async () => {
 
   try {
     const data = await api('/api/app-token', {});
-
     $('tokenOutput').textContent =
       `Activation token (copy now): ${data.token} · Expires ${data.expiresAt}`;
   } catch (err) {
@@ -139,7 +128,6 @@ $('tokenBtn').addEventListener('click', async () => {
 document.querySelectorAll('[data-plan]').forEach((btn) => {
   btn.addEventListener('click', async () => {
     const plan = btn.dataset.plan;
-
     $('account').scrollIntoView({ behavior: 'smooth' });
 
     if (plan === 'free') {
@@ -161,6 +149,6 @@ document.querySelectorAll('[data-plan]').forEach((btn) => {
     const data = await api('/api/account');
     showDashboard(data);
   } catch {
-    // No active session; leave the login and registration forms visible.
+    // No existing session.
   }
 })();
