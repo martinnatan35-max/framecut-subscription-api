@@ -1,5 +1,6 @@
 
 
+
 const API_BASE = 'https://framecut-subscription-api.onrender.com';
 
 const $ = (id) => document.getElementById(id);
@@ -55,7 +56,6 @@ function showMessage(id, text, bad = false) {
   $(id).style.color = bad ? '#ff9b9b' : 'var(--accent)';
 }
 
-// REGISTER
 $('registerForm').addEventListener('submit', async (e) => {
   e.preventDefault();
   showMessage('registerMsg', 'Creating account…');
@@ -65,14 +65,12 @@ $('registerForm').addEventListener('submit', async (e) => {
       email: $('regEmail').value.trim(),
       password: $('regPassword').value
     });
-
     showDashboard(data);
   } catch (err) {
     showMessage('registerMsg', err.message, true);
   }
 });
 
-// LOGIN
 $('loginForm').addEventListener('submit', async (e) => {
   e.preventDefault();
   showMessage('loginMsg', 'Signing in…');
@@ -82,14 +80,12 @@ $('loginForm').addEventListener('submit', async (e) => {
       email: $('loginEmail').value.trim(),
       password: $('loginPassword').value
     });
-
     showDashboard(data);
   } catch (err) {
     showMessage('loginMsg', err.message, true);
   }
 });
 
-// ACCOUNT
 $('accountBtn').addEventListener('click', async () => {
   $('account').scrollIntoView({ behavior: 'smooth' });
 
@@ -102,7 +98,6 @@ $('accountBtn').addEventListener('click', async () => {
   }
 });
 
-// LOGOUT
 $('logoutBtn').addEventListener('click', async () => {
   try {
     await api('/api/auth/logout', {});
@@ -116,13 +111,11 @@ $('logoutBtn').addEventListener('click', async () => {
   $('tokenOutput').textContent = '';
 });
 
-// ACTIVATION TOKEN
 $('tokenBtn').addEventListener('click', async () => {
   showMessage('tokenOutput', 'Checking subscription…');
 
   try {
     const data = await api('/api/app-token', {});
-
     $('tokenOutput').textContent =
       `Activation token (copy now): ${data.token} · Expires ${data.expiresAt}`;
   } catch (err) {
@@ -130,7 +123,6 @@ $('tokenBtn').addEventListener('click', async () => {
   }
 });
 
-// PLAN BUTTONS
 document.querySelectorAll('[data-plan]').forEach((btn) => {
   btn.addEventListener('click', async () => {
     const plan = btn.dataset.plan;
@@ -150,7 +142,6 @@ document.querySelectorAll('[data-plan]').forEach((btn) => {
   });
 });
 
-// CHECK EXISTING SESSION
 (async () => {
   try {
     const data = await api('/api/account');
