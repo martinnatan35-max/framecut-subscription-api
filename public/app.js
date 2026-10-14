@@ -1,107 +1,108 @@
+
+const API_BASE = "https://framecut-subscription-api.onrender.com";
+
 const $ = (id) => document.getElementById(id);
-const API_BASE = 'https://framecut-subscription-api.onrender.com';
-$('year').textContent = new Date().getFullYear();
+
+if ($("year")) {
+  $("year").textContent = new Date().getFullYear();
+}
 
 async function api(path, body) {
   const options = {
-    method: body === undefined ? 'GET' : 'POST',
-    credentials: 'include',
+    method: body === undefined ? "GET" : "POST",
+    credentials: "include",
     headers: {}
   };
+
   if (body !== undefined) {
-    options.headers['Content-Type'] = 'application/json';
+    options.headers["Content-Type"] = "application/json";
     options.body = JSON.stringify(body);
   }
+
   const response = await fetch(`${API_BASE}${path}`, options);
   const data = await response.json().catch(() => ({}));
+
   if (!response.ok) {
-    throw new Error(data.errorMessage || data.error || `Request failed (${response.status})`);
+    throw new Error(
+      data.errorMessage ||
+      data.error ||
+      `Request failed (${response.status})`
+    );
   }
+
   return data;
 }
 
-function showDashboard(data) {
-  if (!data || !data.user) throw new Error('The API response did not include account information.');
-  $('dashboard').classList.remove('hidden');
-  $('accountInfo').textContent = `Signed in as ${data.user.email}`;
-  const s = data.subscription;
-  $('subscriptionInfo').textContent = s
-    ? `Subscription: ${s.plan} · status: ${s.status}${s.current_period_end ? ' · through ' + s.current_period_end : ''}`
-    : 'No subscription is active yet.';
-  $('registerForm').classList.add('hidden');
-  $('loginForm').classList.add('hidden');
-}
-function showMessage(id, message, bad = false) {
-  const el = $(id);
-  el.textContent = message;
-  el.classList.toggle('error', bad);
+function showMessage(message) {
+  const element = $("message") || $("statusMessage");
+
+  if (element) {
+    element.textContent = message;
+    element.hidden = false;
+  } else {
+    alert(message);
+  }
 }
 
-$('registerForm').addEventListener('submit', async (event) => {
-  event.preventDefault();
-  showMessage('registerMsg', 'Creating account…');
+// Existing authentication endpoints
+async function registerAccount(email, password) {
+  return api("/api/auth/register", { email, password });
+}
+
+async function loginAccount(email, password) {
+  return api("/api/auth/login", { email, password });
+}
+
+async function logoutAccount() {
+  return api("/api/auth/logout", {});
+}
+
+async function loadAccount() {
+  return api("/api/account");
+}
+
+// Request checkout from the BACKEND.
+// The server must determine the real price and plan.
+async function startMonthlySubscription() {
   try {
-    const data = await api('/api/auth/register', {
-      email: $('regEmail').value.trim(),
-      password: $('regPassword').value
+    showMessage("Preparing secure checkout...");
+
+    const result = await api("/api/billing/checkout", {
+      plan: "monthly"
     });
-    showDashboard(data);
-  } catch (error) {
-    showMessage('registerMsg', error.message || 'Registration failed.', true);
-  }
-});
-$('loginForm').addEventListener('submit', async (event) => {
-  event.preventDefault();
-  showMessage('loginMsg', 'Signing in…');
-  try {
-    const data = await api('/api/auth/login', {
-      email: $('loginEmail').value.trim(),
-      password: $('loginPassword').value
-    });
-    showDashboard(data);
-  } catch (error) {
-    showMessage('loginMsg', error.message || 'Sign-in failed.', true);
-  }
-});
-$('accountBtn').addEventListener('click', async () => {
-  $('account').scrollIntoView({ behavior: 'smooth' });
-  try {
-    showDashboard(await api('/api/account'));
-  } catch {
-    $('registerForm').classList.remove('hidden');
-    $('loginForm').classList.remove('hidden');
-  }
-});
-$('logoutBtn').addEventListener('click', async () => {
-  try { await api('/api/auth/logout', {}); }
-  catch (error) { console.error('Logout failed:', error.message); }
-  $('dashboard').classList.add('hidden');
-  $('registerForm').classList.remove('hidden');
-  $('loginForm').classList.remove('hidden');
-  $('tokenOutput').textContent = '';
-});
-$('tokenBtn').addEventListener('click', async () => {
-  showMessage('tokenOutput', 'Checking subscription…');
-  try {
-    const data = await api('/api/app-token', {});
-    $('tokenOutput').textContent = `Activation token (copy now): ${data.token} · Expires ${data.expiresAt}`;
-  } catch (error) {
-    showMessage('tokenOutput', error.message || 'Could not generate a token.', true);
-  }
-});
-document.querySelectorAll('[data-plan]').forEach((button) => {
-  button.addEventListener('click', async () => {
-    const plan = button.dataset.plan;
-    $('account').scrollIntoView({ behavior: 'smooth' });
-    if (plan === 'free') {
-      showMessage('registerMsg', 'Create a free account below.');
-      return;
+
+    if (!result.checkoutUrl) {
+      throw new Error(
+        "Checkout is not configured on the server yet."
+      );
     }
-    try { await api('/api/billing/start', { plan }); }
-    catch (error) { alert(error.message || 'Checkout is not available yet.'); }
-  });
-});
-(async () => {
-  try { showDashboard(await api('/api/account')); }
-  catch { /* No active session; leave sign-in forms visible. */ }
-})();
+
+    // Only redirect to a valid HTTPS checkout URL.
+    const checkoutUrl = new URL(result.checkoutUrl);
+
+    if (checkoutUrl.protocol !== "https:") {
+      throw new Error("The checkout URL is not secure.");
+    }
+
+    window.location.assign(checkoutUrl.href);
+  } catch (error) {
+    showMessage(error.message || "Unable to start checkout.");
+  }
+}
+
+// Attach this to an existing button with id="subscribeMonthly",
+// if that button exists in your HTML.
+const subscribeButton = $("subscribeMonthly");
+
+if (subscribeButton) {
+  subscribeButton.addEventListener("click", startMonthlySubscription);
+}
+
+// Load account information when requested by your dashboard.
+window.frameCutAPI = {
+  registerAccount,
+  loginAccount,
+  logoutAccount,
+  loadAccount,
+  startMonthlySubscription
+};
