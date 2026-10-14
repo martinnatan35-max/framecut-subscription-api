@@ -14,10 +14,13 @@ const app = express();
 const isProd = process.env.NODE_ENV === 'production';
 const port = Number(process.env.PORT || 3000);
 const baseUrl = (process.env.BASE_URL || `http://localhost:${port}`).replace(/\/$/, '');
+const frontendUrl = (process.env.FRONTEND_URL || 'https://framecutss.pages.dev').replace(/\/$/, '');
 const dbPath = process.env.DATABASE_PATH || './data/framecut.sqlite';
 
-fs.mkdirSync(path.dirname(path.resolve(dbPath)), { recursive: true });
+const MONTHLY_PRICE_CENTAVOS = 29900;
+const PAYMENTS_ENABLED = process.env.PAYMENTS_ENABLED === 'true';
 
+fs.mkdirSync(path.dirname(path.resolve(dbPath)), { recursive: true });
 const db = new Database(dbPath);
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
@@ -62,19 +65,29 @@ CREATE TABLE IF NOT EXISTS webhook_events (
  received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX IF NOT EXISTS idx_web_sessions_expiry
-ON web_sessions(expires_at);
+CREATE TABLE IF NOT EXISTS payment_orders (
+ id TEXT PRIMARY KEY,
+ user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ provider_checkout_id TEXT UNIQUE,
+ amount INTEGER NOT NULL,
+ currency TEXT NOT NULL DEFAULT 'PHP',
+ status TEXT NOT NULL DEFAULT 'pending'
+   CHECK(status IN ('pending','paid','failed','expired')),
+ created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ paid_at TEXT
+);
 
+CREATE INDEX IF NOT EXISTS idx_web_sessions_expiry
+ ON web_sessions(expires_at);
 CREATE INDEX IF NOT EXISTS idx_app_tokens_expiry
-ON app_tokens(expires_at);
+ ON app_tokens(expires_at);
+CREATE INDEX IF NOT EXISTS idx_orders_user
+ ON payment_orders(user_id, created_at);
 `);
 
 app.disable('x-powered-by');
 
-// CORS: allow the FrameCut website to call this API.
-const allowedOrigins = new Set([
-  'https://framecutss.pages.dev'
-]);
+const allowedOrigins = new Set([frontendUrl]);
 
 app.use((req, res, next) => {
   const origin = req.get('Origin');
@@ -84,17 +97,11 @@ app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Credentials', 'true');
     res.setHeader('Vary', 'Origin');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader(
-      'Access-Control-Allow-Headers',
-      'Content-Type, Authorization'
-    );
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   }
 
   if (req.method === 'OPTIONS') {
-    if (!origin || !allowedOrigins.has(origin)) {
-      return res.sendStatus(403);
-    }
-
+    if (!origin || !allowedOrigins.has(origin)) return res.sendStatus(403);
     return res.sendStatus(204);
   }
 
@@ -108,24 +115,23 @@ app.use(helmet({
       styleSrc: ["'self'", "'unsafe-inline'"],
       scriptSrc: ["'self'"],
       imgSrc: ["'self'", 'data:'],
-      connectSrc: [
-        "'self'",
-        'https://framecut-subscription-api.onrender.com'
-      ],
+      connectSrc: ["'self'", baseUrl],
       objectSrc: ["'none'"],
       upgradeInsecureRequests: isProd ? [] : null
     }
   }
 }));
 
-app.use((req, res, next) => {
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-  next();
-});
-
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   limit: 30,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false
+});
+
+const billingLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 10,
   standardHeaders: 'draft-7',
   legacyHeaders: false
 });
@@ -141,8 +147,7 @@ function randomToken() {
 }
 
 function emailIsValid(email) {
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
-    && email.length <= 254;
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) && email.length <= 254;
 }
 
 function getCookie(req, name) {
@@ -150,16 +155,18 @@ function getCookie(req, name) {
 
   for (const part of raw.split(';')) {
     const i = part.indexOf('=');
-
     if (i > -1 && part.slice(0, i).trim() === name) {
-      return decodeURIComponent(part.slice(i + 1).trim());
+      try {
+        return decodeURIComponent(part.slice(i + 1).trim());
+      } catch {
+        return null;
+      }
     }
   }
 
   return null;
 }
 
-// Cross-site cookies require SameSite=None and Secure in production.
 function setSessionCookie(res, token, maxAgeSeconds) {
   res.setHeader(
     'Set-Cookie',
@@ -177,11 +184,7 @@ function clearSessionCookie(res) {
 function requireUser(req, res, next) {
   const token = getCookie(req, 'fc_session');
 
-  if (!token) {
-    return res.status(401).json({
-      error: 'Please sign in.'
-    });
-  }
+  if (!token) return res.status(401).json({ error: 'Please sign in.' });
 
   const row = db.prepare(`
     SELECT u.id, u.email
@@ -192,10 +195,7 @@ function requireUser(req, res, next) {
 
   if (!row) {
     clearSessionCookie(res);
-
-    return res.status(401).json({
-      error: 'Session expired. Please sign in again.'
-    });
+    return res.status(401).json({ error: 'Session expired. Please sign in again.' });
   }
 
   req.user = row;
@@ -204,11 +204,8 @@ function requireUser(req, res, next) {
 
 function currentSubscription(userId) {
   return db.prepare(`
-    SELECT
-      plan,
-      status,
-      current_period_end,
-      current_period_end AS expiresAt
+    SELECT plan, status, current_period_end,
+           current_period_end AS expiresAt
     FROM subscriptions
     WHERE user_id = ?
     ORDER BY updated_at DESC
@@ -216,20 +213,22 @@ function currentSubscription(userId) {
   `).get(userId) || null;
 }
 
-// PayMongo webhook must be mounted before JSON parsing.
+/*
+ * PayMongo webhook: keep this route BEFORE express.json().
+ * This route deliberately fails closed until the actual event payload
+ * and signature configuration have been tested.
+ */
 app.post(
   '/webhooks/paymongo',
-  express.raw({
-    type: 'application/json',
-    limit: '1mb'
-  }),
+  express.raw({ type: 'application/json', limit: '1mb' }),
   (req, res) => {
     const secret = process.env.PAYMONGO_WEBHOOK_SECRET;
-
     if (!secret) {
-      return res.status(503).json({
-        error: 'Webhook secret is not configured.'
-      });
+      return res.status(503).json({ error: 'Webhook is not configured.' });
+    }
+
+    if (!Buffer.isBuffer(req.body)) {
+      return res.status(400).json({ error: 'Expected raw webhook body.' });
     }
 
     const header =
@@ -238,143 +237,92 @@ app.post(
       '';
 
     const parts = Object.fromEntries(
-      header.split(',').map(item => {
-        const i = item.indexOf('=');
-
+      header.split(',').map(part => {
+        const i = part.indexOf('=');
         return i < 0
-          ? [item, '']
-          : [
-              item.slice(0, i).trim(),
-              item.slice(i + 1).trim()
-            ];
+          ? [part.trim(), '']
+          : [part.slice(0, i).trim(), part.slice(i + 1).trim()];
       })
     );
 
     const timestamp = parts.t;
+    const suppliedText =
+      process.env.PAYMONGO_LIVE_MODE === 'true' ? parts.li : parts.te;
 
     if (
       !timestamp ||
-      (!parts.te && !parts.li) ||
+      !/^\d+$/.test(timestamp) ||
+      !suppliedText ||
       Math.abs(Date.now() / 1000 - Number(timestamp)) > 300
     ) {
-      return res.status(401).json({
-        error: 'Invalid or stale webhook signature.'
-      });
+      return res.status(401).json({ error: 'Invalid webhook signature header.' });
     }
 
-    const signed = Buffer.from(
-      crypto
-        .createHmac('sha256', secret)
-        .update(`${timestamp}.${req.body.toString('utf8')}`)
-        .digest('hex')
-    );
+    const bodyText = req.body.toString('utf8');
+    const expected = crypto
+      .createHmac('sha256', secret)
+      .update(`${timestamp}.${bodyText}`)
+      .digest();
 
-    const suppliedText =
-      process.env.PAYMONGO_LIVE_MODE === 'true'
-        ? parts.li
-        : parts.te;
-
-    if (!suppliedText) {
-      return res.status(401).json({
-        error: 'Missing signature for configured mode.'
-      });
-    }
-
-    const supplied = Buffer.from(suppliedText);
+    const supplied = Buffer.from(suppliedText, 'hex');
 
     if (
-      signed.length !== supplied.length ||
-      !crypto.timingSafeEqual(signed, supplied)
+      supplied.length !== expected.length ||
+      !crypto.timingSafeEqual(supplied, expected)
     ) {
-      return res.status(401).json({
-        error: 'Signature verification failed.'
-      });
+      return res.status(401).json({ error: 'Signature verification failed.' });
     }
 
     let event;
-
     try {
-      event = JSON.parse(req.body.toString('utf8'));
+      event = JSON.parse(bodyText);
     } catch {
-      return res.status(400).json({
-        error: 'Invalid JSON.'
-      });
+      return res.status(400).json({ error: 'Invalid webhook JSON.' });
     }
 
-    const eventId = event?.data?.id || event?.id;
+    const eventId = event?.data?.id;
+    const eventType = event?.data?.attributes?.type;
+    const resource = event?.data?.attributes?.data;
+    const attrs = resource?.attributes || {};
 
-    if (!eventId) {
-      return res.status(400).json({
-        error: 'Missing event ID.'
-      });
+    if (!eventId || !eventType) {
+      return res.status(400).json({ error: 'Missing event ID or type.' });
     }
 
     try {
-      const already = db.prepare(
-        'SELECT event_id FROM webhook_events WHERE event_id = ?'
-      ).get(eventId);
+      const processEvent = db.transaction(() => {
+        const existing = db.prepare(
+          'SELECT event_id FROM webhook_events WHERE event_id = ?'
+        ).get(eventId);
 
-      if (already) {
-        return res.status(200).json({
-          received: true,
-          duplicate: true
-        });
-      }
+        if (existing) return 'duplicate';
 
-      const resource =
-        event?.data?.attributes?.data ||
-        event?.data?.attributes?.resource ||
-        event?.data?.attributes ||
-        {};
+        /*
+         * Important: payment activation is intentionally NOT implemented
+         * here yet. A verified signature proves who sent an event, but
+         * does not by itself prove this payment belongs to a particular
+         * order. The exact PayMongo event shape and checkout/order linkage
+         * must be verified before enabling subscription activation.
+         */
+        db.prepare(
+          'INSERT INTO webhook_events(event_id) VALUES (?)'
+        ).run(eventId);
 
-      const type = resource?.type || '';
-      const attrs = resource?.attributes || resource;
-      const providerSubId = resource?.id || attrs?.subscription_id;
-      const status = attrs?.status;
-
-      // Only verified webhooks may update subscription status.
-      if (type === 'subscription' && providerSubId && status) {
-        const allowed = [
-          'active',
-          'past_due',
-          'unpaid',
-          'cancelled',
-          'incomplete',
-          'incomplete_cancelled'
-        ];
-
-        if (allowed.includes(status)) {
-          db.prepare(`
-            UPDATE subscriptions
-            SET status = ?, updated_at = CURRENT_TIMESTAMP
-            WHERE provider_subscription_id = ?
-          `).run(status, providerSubId);
-        }
-      }
-
-      db.prepare(
-        'INSERT INTO webhook_events(event_id) VALUES(?)'
-      ).run(eventId);
-
-      return res.status(200).json({
-        received: true
+        return 'received';
       });
+
+      const result = processEvent();
+      return res.status(200).json({ received: true, result });
     } catch (error) {
       console.error('Webhook processing error:', error.message);
-
-      return res.status(500).json({
-        error: 'Webhook processing failed.'
-      });
+      return res.status(500).json({ error: 'Webhook processing failed.' });
     }
   }
 );
 
 app.use(jsonParser);
 
-app.use(express.static(
-  path.join(__dirname, 'public'),
-  { extensions: ['html'] }
-));
+app.use(express.static(path.join(__dirname, 'public'), { extensions: ['html'] }));
 
 app.get('/health', (_req, res) => {
   res.json({
@@ -384,15 +332,14 @@ app.get('/health', (_req, res) => {
   });
 });
 
-// Register an account.
+/* ---------------- Authentication ---------------- */
+
 app.post('/api/auth/register', authLimiter, async (req, res) => {
   const email = String(req.body?.email || '').trim().toLowerCase();
   const password = String(req.body?.password || '');
 
   if (!emailIsValid(email)) {
-    return res.status(400).json({
-      error: 'Enter a valid email address.'
-    });
+    return res.status(400).json({ error: 'Enter a valid email address.' });
   }
 
   if (password.length < 12 || password.length > 200) {
@@ -402,9 +349,7 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
   }
 
   if (db.prepare('SELECT id FROM users WHERE email = ?').get(email)) {
-    return res.status(409).json({
-      error: 'An account with that email already exists.'
-    });
+    return res.status(409).json({ error: 'An account with that email already exists.' });
   }
 
   const id = crypto.randomUUID();
@@ -412,57 +357,40 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
   try {
     const hash = await bcrypt.hash(password, 12);
 
-    db.prepare(`
-      INSERT INTO users(id, email, password_hash)
-      VALUES(?, ?, ?)
-    `).run(id, email, hash);
+    db.prepare(
+      'INSERT INTO users(id, email, password_hash) VALUES (?, ?, ?)'
+    ).run(id, email, hash);
 
     const token = randomToken();
     const days = Math.max(1, Number(process.env.SESSION_DAYS || 7));
 
     db.prepare(`
       INSERT INTO web_sessions(token_hash, user_id, expires_at, created_at)
-      VALUES(?, ?, ?, ?)
-    `).run(
-      sha256(token),
-      id,
-      Date.now() + days * 86400000,
-      Date.now()
-    );
+      VALUES (?, ?, ?, ?)
+    `).run(sha256(token), id, Date.now() + days * 86400000, Date.now());
 
     setSessionCookie(res, token, days * 86400);
 
-    res.status(201).json({
+    return res.status(201).json({
       user: { id, email },
       subscription: currentSubscription(id)
     });
   } catch (error) {
-    console.error(error.message);
-
-    res.status(500).json({
-      error: 'Could not create account.'
-    });
+    console.error('Registration error:', error.message);
+    return res.status(500).json({ error: 'Could not create account.' });
   }
 });
 
-// Log in.
 app.post('/api/auth/login', authLimiter, async (req, res) => {
   const email = String(req.body?.email || '').trim().toLowerCase();
   const password = String(req.body?.password || '');
 
-  const user = db.prepare(`
-    SELECT id, email, password_hash
-    FROM users
-    WHERE email = ?
-  `).get(email);
+  const user = db.prepare(
+    'SELECT id, email, password_hash FROM users WHERE email = ?'
+  ).get(email);
 
-  if (
-    !user ||
-    !(await bcrypt.compare(password, user.password_hash))
-  ) {
-    return res.status(401).json({
-      error: 'Email or password is incorrect.'
-    });
+  if (!user || !(await bcrypt.compare(password, user.password_hash))) {
+    return res.status(401).json({ error: 'Email or password is incorrect.' });
   }
 
   const token = randomToken();
@@ -470,59 +398,46 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
 
   db.prepare(`
     INSERT INTO web_sessions(token_hash, user_id, expires_at, created_at)
-    VALUES(?, ?, ?, ?)
-  `).run(
-    sha256(token),
-    user.id,
-    Date.now() + days * 86400000,
-    Date.now()
-  );
+    VALUES (?, ?, ?, ?)
+  `).run(sha256(token), user.id, Date.now() + days * 86400000, Date.now());
 
   setSessionCookie(res, token, days * 86400);
 
-  res.json({
-    user: {
-      id: user.id,
-      email: user.email
-    },
+  return res.json({
+    user: { id: user.id, email: user.email },
     subscription: currentSubscription(user.id)
   });
 });
 
-// Log out.
 app.post('/api/auth/logout', (req, res) => {
   const token = getCookie(req, 'fc_session');
 
   if (token) {
-    db.prepare(
-      'DELETE FROM web_sessions WHERE token_hash = ?'
-    ).run(sha256(token));
+    db.prepare('DELETE FROM web_sessions WHERE token_hash = ?')
+      .run(sha256(token));
   }
 
   clearSessionCookie(res);
-
-  res.json({ ok: true });
+  return res.json({ ok: true });
 });
 
-// Account information.
 app.get('/api/account', requireUser, (req, res) => {
-  res.json({
+  res.setHeader('Cache-Control', 'no-store');
+  return res.json({
     user: req.user,
     subscription: currentSubscription(req.user.id)
   });
 });
 
-// Generate a desktop-app activation token.
 app.post('/api/app-token', requireUser, (req, res) => {
   const sub = currentSubscription(req.user.id);
 
   if (
     !sub ||
     sub.status !== 'active' ||
-    (
-      sub.current_period_end &&
-      Date.parse(sub.current_period_end) < Date.now()
-    )
+    !sub.current_period_end ||
+    !Number.isFinite(Date.parse(sub.current_period_end)) ||
+    Date.parse(sub.current_period_end) <= Date.now()
   ) {
     return res.status(403).json({
       error: 'An active subscription is required before generating an app activation token.'
@@ -530,109 +445,108 @@ app.post('/api/app-token', requireUser, (req, res) => {
   }
 
   const token = randomToken();
-  const days = Math.max(
-    1,
-    Math.min(90, Number(process.env.APP_TOKEN_DAYS || 30))
-  );
+  const days = Math.max(1, Math.min(90, Number(process.env.APP_TOKEN_DAYS || 30)));
+  const expiresAt = Date.now() + days * 86400000;
 
   db.prepare(`
     INSERT INTO app_tokens(token_hash, user_id, expires_at, created_at)
-    VALUES(?, ?, ?, ?)
-  `).run(
-    sha256(token),
-    req.user.id,
-    Date.now() + days * 86400000,
-    Date.now()
-  );
+    VALUES (?, ?, ?, ?)
+  `).run(sha256(token), req.user.id, expiresAt, Date.now());
 
-  res.json({
+  return res.json({
     token,
-    expiresAt: new Date(Date.now() + days * 86400000).toISOString(),
+    expiresAt: new Date(expiresAt).toISOString(),
     message: 'Copy this token into FrameCut activation. It is shown only once.'
   });
 });
 
-// Desktop-app license verification.
 app.get('/api/license/status', (req, res) => {
-  const header = req.get('authorization') || '';
-  const match = header.match(/^Bearer\s+(.+)$/i);
+  const auth = req.get('authorization') || '';
+  const match = auth.match(/^Bearer\s+(.+)$/i);
 
   if (!match) {
-    return res.status(401).json({
-      active: false,
-      error: 'Missing bearer token.'
-    });
+    return res.status(401).json({ active: false, error: 'Missing bearer token.' });
   }
 
   const row = db.prepare(`
     SELECT u.id
     FROM app_tokens t
     JOIN users u ON u.id = t.user_id
-    WHERE t.token_hash = ?
-      AND t.revoked = 0
-      AND t.expires_at > ?
+    WHERE t.token_hash = ? AND t.revoked = 0 AND t.expires_at > ?
   `).get(sha256(match[1]), Date.now());
 
   if (!row) {
-    return res.status(401).json({
-      active: false,
-      error: 'Invalid or expired app token.'
-    });
+    return res.status(401).json({ active: false, error: 'Invalid or expired app token.' });
   }
 
   const sub = currentSubscription(row.id);
-
-  const active =
-    !!sub &&
+  const active = Boolean(
+    sub &&
     sub.status === 'active' &&
-    (
-      !sub.current_period_end ||
-      Date.parse(sub.current_period_end) > Date.now()
-    );
+    sub.current_period_end &&
+    Number.isFinite(Date.parse(sub.current_period_end)) &&
+    Date.parse(sub.current_period_end) > Date.now()
+  );
 
   res.setHeader('Cache-Control', 'no-store');
-
-  res.json({
+  return res.json({
     active,
     plan: active ? sub.plan : null,
     expiresAt: active ? sub.current_period_end : null
   });
 });
 
-// Billing is intentionally disabled until checkout is fully implemented.
-app.post('/api/billing/start', requireUser, (_req, res) => {
-  if (process.env.PAYMENTS_ENABLED !== 'true') {
+/* ---------------- Billing ---------------- */
+
+/*
+ * This route intentionally does NOT create a checkout yet.
+ * It keeps billing disabled until:
+ * 1. PayMongo checkout request/response fields are confirmed for your account.
+ * 2. The webhook's exact event format and order matching are tested.
+ * 3. Payment idempotency and expiry renewal are implemented and tested.
+ */
+app.post('/api/billing/checkout', requireUser, billingLimiter, async (req, res) => {
+  if (!PAYMENTS_ENABLED) {
     return res.status(503).json({
-      error: 'Checkout is not enabled yet. Finish payment-provider onboarding, checkout implementation, and webhook testing first.'
+      error: 'Checkout is disabled until the PayMongo integration has been tested.'
     });
   }
 
-  return res.status(501).json({
-    error: 'Payment provider checkout adapter is not yet implemented. Keep PAYMENTS_ENABLED=false until it is complete.'
+  const secretKey = process.env.PAYMONGO_SECRET_KEY;
+
+  if (!secretKey) {
+    return res.status(503).json({ error: 'Payment provider is not configured.' });
+  }
+
+  /*
+   * Fail closed rather than accept money with an incomplete webhook.
+   * Do not set PAYMENTS_ENABLED=true until this adapter is completed.
+   */
+  return res.status(503).json({
+    error: 'Checkout adapter is not enabled. Complete and test webhook payment verification first.'
   });
 });
 
-// Serve the website for non-API routes.
+/* Keep the existing route available for older frontend versions. */
+app.post('/api/billing/start', requireUser, (_req, res) => {
+  return res.status(503).json({
+    error: 'Checkout is disabled until PayMongo integration tests are complete.'
+  });
+});
+
 app.get('*', (req, res, next) => {
-  if (
-    req.path.startsWith('/api/') ||
-    req.path.startsWith('/webhooks/')
-  ) {
+  if (req.path.startsWith('/api/') || req.path.startsWith('/webhooks/')) {
     return next();
   }
 
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+  return res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-// Error handler.
 app.use((err, _req, res, _next) => {
-  console.error(err.message);
-
-  res.status(500).json({
-    error: 'Unexpected server error.'
-  });
+  console.error('Server error:', err.message);
+  return res.status(500).json({ error: 'Unexpected server error.' });
 });
 
 app.listen(port, () => {
-  console.log(`FrameCut subscription starter listening on ${baseUrl}`);
+  console.log(`FrameCut subscription API listening on ${baseUrl}`);
 });
