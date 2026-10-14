@@ -16,28 +16,46 @@ async function api(path, body) {
     options.body = JSON.stringify(body);
   }
 
-  const res = await fetch(`${API_BASE}${path}`, options);
-  const data = await res.json().catch(() => ({}));
+  const url = `${API_BASE}${path}`;
+  const response = await fetch(url, options);
+  const text = await response.text();
 
-  if (!res.ok) {
-    throw new Error(data.error || `Request failed (${res.status})`);
+  let data = {};
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch {
+    data = { error: text || 'The server returned an unreadable response.' };
+  }
+
+  if (!response.ok) {
+    throw new Error(
+      `${response.status} ${response.statusText}: ` +
+      (data.error || data.errorMessage || 'Request failed.')
+    );
   }
 
   return data;
 }
 
 function showMessage(id, text, bad = false) {
-  $(id).textContent = text;
-  $(id).style.color = bad ? '#ff9b9b' : 'var(--accent)';
+  const element = $(id);
+  if (!element) return;
+
+  element.textContent = text;
+  element.style.color = bad ? '#ff9b9b' : 'var(--accent)';
 }
 
 function showDashboard(data) {
+  if (!data.user) {
+    throw new Error('The server response did not include account information.');
+  }
+
   $('dashboard').classList.remove('hidden');
   $('accountInfo').textContent = `Signed in as ${data.user.email}`;
 
-  const s = data.subscription;
-  $('subscriptionInfo').textContent = s
-    ? `Subscription: ${s.plan} · Status: ${s.status}${s.current_period_end ? ' · Through ' + s.current_period_end : ''}`
+  const subscription = data.subscription;
+  $('subscriptionInfo').textContent = subscription
+    ? `Subscription: ${subscription.plan} · Status: ${subscription.status}`
     : 'No subscription is active yet.';
 
   $('registerForm').classList.add('hidden');
@@ -50,35 +68,56 @@ function showAuthForms() {
   $('loginForm').classList.remove('hidden');
 }
 
-$('registerForm').addEventListener('submit', async (e) => {
-  e.preventDefault();
+$('registerForm').addEventListener('submit', async (event) => {
+  event.preventDefault();
+
+  const email = $('regEmail').value.trim();
+  const password = $('regPassword').value;
+
+  if (!email || !password) {
+    showMessage('registerMsg', 'Enter your email and password.', true);
+    return;
+  }
+
+  if (password.length < 12 || password.length > 200) {
+    showMessage(
+      'registerMsg',
+      'Use a password between 12 and 200 characters.',
+      true
+    );
+    return;
+  }
+
   showMessage('registerMsg', 'Creating account…');
 
   try {
-    const data = await api('/api/auth/register', {
-      email: $('regEmail').value.trim(),
-      password: $('regPassword').value
-    });
+    const data = await api('/api/auth/register', { email, password });
     showDashboard(data);
     showMessage('registerMsg', 'Account created successfully.');
-  } catch (err) {
-    showMessage('registerMsg', err.message, true);
+  } catch (error) {
+    showMessage('registerMsg', error.message, true);
   }
 });
 
-$('loginForm').addEventListener('submit', async (e) => {
-  e.preventDefault();
+$('loginForm').addEventListener('submit', async (event) => {
+  event.preventDefault();
+
+  const email = $('loginEmail').value.trim();
+  const password = $('loginPassword').value;
+
+  if (!email || !password) {
+    showMessage('loginMsg', 'Enter your email and password.', true);
+    return;
+  }
+
   showMessage('loginMsg', 'Signing in…');
 
   try {
-    const data = await api('/api/auth/login', {
-      email: $('loginEmail').value.trim(),
-      password: $('loginPassword').value
-    });
+    const data = await api('/api/auth/login', { email, password });
     showDashboard(data);
     showMessage('loginMsg', 'Signed in successfully.');
-  } catch (err) {
-    showMessage('loginMsg', err.message, true);
+  } catch (error) {
+    showMessage('loginMsg', error.message, true);
   }
 });
 
@@ -96,8 +135,8 @@ $('logoutBtn').addEventListener('click', async () => {
   try {
     await api('/api/auth/logout', {});
     showMessage('loginMsg', 'You have signed out.');
-  } catch (err) {
-    showMessage('loginMsg', err.message, true);
+  } catch (error) {
+    showMessage('loginMsg', error.message, true);
   }
 
   showAuthForms();
@@ -110,9 +149,9 @@ $('tokenBtn').addEventListener('click', async () => {
   try {
     const data = await api('/api/app-token', {});
     $('tokenOutput').textContent =
-      `Activation token (copy now): ${data.token} · Expires ${data.expiresAt}`;
-  } catch (err) {
-    showMessage('tokenOutput', err.message, true);
+      `Activation token: ${data.token} · Expires ${data.expiresAt}`;
+  } catch (error) {
+    showMessage('tokenOutput', error.message, true);
   }
 });
 
@@ -129,17 +168,16 @@ document.querySelectorAll('[data-plan]').forEach((button) => {
 
     try {
       await api('/api/billing/start', { plan });
-      alert('Checkout request completed. Follow the payment provider instructions.');
-    } catch (err) {
-      alert(err.message);
+      alert('Checkout request completed.');
+    } catch (error) {
+      alert(error.message);
     }
   });
 });
 
 (async () => {
   try {
-    const data = await api('/api/account');
-    showDashboard(data);
+    showDashboard(await api('/api/account'));
   } catch {
     showAuthForms();
   }
