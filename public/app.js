@@ -1,5 +1,7 @@
 
+
 const API_BASE = 'https://framecut-subscription-api.onrender.com';
+
 const $ = (id) => document.getElementById(id);
 
 $('year').textContent = new Date().getFullYear();
@@ -16,169 +18,149 @@ async function api(path, body) {
     options.body = JSON.stringify(body);
   }
 
-  const url = `${API_BASE}${path}`;
-  const response = await fetch(url, options);
-  const text = await response.text();
+  const res = await fetch(`${API_BASE}${path}`, options);
 
-  let data = {};
-  try {
-    data = text ? JSON.parse(text) : {};
-  } catch {
-    data = { error: text || 'The server returned an unreadable response.' };
-  }
+  const data = await res.json().catch(() => ({}));
 
-  if (!response.ok) {
+  if (!res.ok) {
     throw new Error(
-      `${response.status} ${response.statusText}: ` +
-      (data.error || data.errorMessage || 'Request failed.')
+      data.errorMessage ||
+      data.error ||
+      `Request failed (${res.status})`
     );
   }
 
   return data;
 }
 
-function showMessage(id, text, bad = false) {
-  const element = $(id);
-  if (!element) return;
-
-  element.textContent = text;
-  element.style.color = bad ? '#ff9b9b' : 'var(--accent)';
-}
-
 function showDashboard(data) {
-  if (!data.user) {
-    throw new Error('The server response did not include account information.');
-  }
-
   $('dashboard').classList.remove('hidden');
-  $('accountInfo').textContent = `Signed in as ${data.user.email}`;
 
-  const subscription = data.subscription;
-  $('subscriptionInfo').textContent = subscription
-    ? `Subscription: ${subscription.plan} · Status: ${subscription.status}`
+  $('accountInfo').textContent =
+    `Signed in as ${data.user.email}`;
+
+  const s = data.subscription;
+
+  $('subscriptionInfo').textContent = s
+    ? `Subscription: ${s.plan} · status: ${s.status}${
+        s.current_period_end
+          ? ' · through ' + s.current_period_end
+          : ''
+      }`
     : 'No subscription is active yet.';
 
   $('registerForm').classList.add('hidden');
   $('loginForm').classList.add('hidden');
 }
 
-function showAuthForms() {
-  $('dashboard').classList.add('hidden');
-  $('registerForm').classList.remove('hidden');
-  $('loginForm').classList.remove('hidden');
+function showMessage(id, text, bad = false) {
+  $(id).textContent = text;
+  $(id).style.color = bad ? '#ff9b9b' : 'var(--accent)';
 }
 
-$('registerForm').addEventListener('submit', async (event) => {
-  event.preventDefault();
-
-  const email = $('regEmail').value.trim();
-  const password = $('regPassword').value;
-
-  if (!email || !password) {
-    showMessage('registerMsg', 'Enter your email and password.', true);
-    return;
-  }
-
-  if (password.length < 12 || password.length > 200) {
-    showMessage(
-      'registerMsg',
-      'Use a password between 12 and 200 characters.',
-      true
-    );
-    return;
-  }
+// REGISTER
+$('registerForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
 
   showMessage('registerMsg', 'Creating account…');
 
   try {
-    const data = await api('/api/auth/register', { email, password });
+    const data = await api('/api/auth/register', {
+      email: $('regEmail').value.trim(),
+      password: $('regPassword').value
+    });
+
     showDashboard(data);
-    showMessage('registerMsg', 'Account created successfully.');
-  } catch (error) {
-    showMessage('registerMsg', error.message, true);
+  } catch (err) {
+    showMessage('registerMsg', err.message, true);
   }
 });
 
-$('loginForm').addEventListener('submit', async (event) => {
-  event.preventDefault();
-
-  const email = $('loginEmail').value.trim();
-  const password = $('loginPassword').value;
-
-  if (!email || !password) {
-    showMessage('loginMsg', 'Enter your email and password.', true);
-    return;
-  }
+// LOGIN
+$('loginForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
 
   showMessage('loginMsg', 'Signing in…');
 
   try {
-    const data = await api('/api/auth/login', { email, password });
+    const data = await api('/api/auth/login', {
+      email: $('loginEmail').value.trim(),
+      password: $('loginPassword').value
+    });
+
     showDashboard(data);
-    showMessage('loginMsg', 'Signed in successfully.');
-  } catch (error) {
-    showMessage('loginMsg', error.message, true);
+  } catch (err) {
+    showMessage('loginMsg', err.message, true);
   }
 });
 
+// ACCOUNT
 $('accountBtn').addEventListener('click', async () => {
   $('account').scrollIntoView({ behavior: 'smooth' });
 
   try {
-    showDashboard(await api('/api/account'));
+    const data = await api('/api/account');
+    showDashboard(data);
   } catch {
-    showAuthForms();
+    $('registerForm').classList.remove('hidden');
+    $('loginForm').classList.remove('hidden');
   }
 });
 
+// LOGOUT
 $('logoutBtn').addEventListener('click', async () => {
   try {
     await api('/api/auth/logout', {});
-    showMessage('loginMsg', 'You have signed out.');
-  } catch (error) {
-    showMessage('loginMsg', error.message, true);
+  } catch (err) {
+    console.error('Logout request failed:', err.message);
   }
 
-  showAuthForms();
+  $('dashboard').classList.add('hidden');
+  $('registerForm').classList.remove('hidden');
+  $('loginForm').classList.remove('hidden');
   $('tokenOutput').textContent = '';
 });
 
+// APP TOKEN
 $('tokenBtn').addEventListener('click', async () => {
   showMessage('tokenOutput', 'Checking subscription…');
 
   try {
     const data = await api('/api/app-token', {});
+
     $('tokenOutput').textContent =
-      `Activation token: ${data.token} · Expires ${data.expiresAt}`;
-  } catch (error) {
-    showMessage('tokenOutput', error.message, true);
+      `Activation token (copy now): ${data.token} · Expires ${data.expiresAt}`;
+  } catch (err) {
+    showMessage('tokenOutput', err.message, true);
   }
 });
 
-document.querySelectorAll('[data-plan]').forEach((button) => {
-  button.addEventListener('click', async () => {
-    const plan = button.dataset.plan;
+// PLAN BUTTONS
+document.querySelectorAll('[data-plan]').forEach((btn) => {
+  btn.addEventListener('click', async () => {
+    const plan = btn.dataset.plan;
+
     $('account').scrollIntoView({ behavior: 'smooth' });
 
     if (plan === 'free') {
-      showMessage('registerMsg', 'Create your free account below.');
-      $('regEmail').focus();
+      showMessage('registerMsg', 'Create a free account below.');
       return;
     }
 
     try {
       await api('/api/billing/start', { plan });
-      alert('Checkout request completed.');
-    } catch (error) {
-      alert(error.message);
+    } catch (err) {
+      alert(err.message);
     }
   });
 });
 
+// CHECK EXISTING SESSION
 (async () => {
   try {
-    showDashboard(await api('/api/account'));
+    const data = await api('/api/account');
+    showDashboard(data);
   } catch {
-    showAuthForms();
+    // No active session; leave the login and registration forms visible.
   }
 })();
