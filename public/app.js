@@ -1,4 +1,5 @@
 
+
 const API_BASE = 'https://framecut-subscription-api.onrender.com';
 
 const $ = (id) => document.getElementById(id);
@@ -7,7 +8,7 @@ $('year').textContent = new Date().getFullYear();
 
 async function api(path, body) {
   const options = {
-    method: body !== undefined ? 'POST' : 'GET',
+    method: body === undefined ? 'GET' : 'POST',
     credentials: 'include',
     headers: {}
   };
@@ -39,7 +40,9 @@ function showDashboard(data) {
 
   $('subscriptionInfo').textContent = s
     ? `Subscription: ${s.plan} · status: ${s.status}${
-        s.current_period_end ? ' · through ' + s.current_period_end : ''
+        s.current_period_end
+          ? ' · through ' + s.current_period_end
+          : ''
       }`
     : 'No subscription is active yet.';
 
@@ -62,6 +65,7 @@ $('registerForm').addEventListener('submit', async (e) => {
       email: $('regEmail').value.trim(),
       password: $('regPassword').value
     });
+
     showDashboard(data);
   } catch (err) {
     showMessage('registerMsg', err.message, true);
@@ -78,6 +82,7 @@ $('loginForm').addEventListener('submit', async (e) => {
       email: $('loginEmail').value.trim(),
       password: $('loginPassword').value
     });
+
     showDashboard(data);
   } catch (err) {
     showMessage('loginMsg', err.message, true);
@@ -111,12 +116,13 @@ $('logoutBtn').addEventListener('click', async () => {
   $('tokenOutput').textContent = '';
 });
 
-// APP TOKEN
+// ACTIVATION TOKEN
 $('tokenBtn').addEventListener('click', async () => {
   showMessage('tokenOutput', 'Checking subscription…');
 
   try {
     const data = await api('/api/app-token', {});
+
     $('tokenOutput').textContent =
       `Activation token (copy now): ${data.token} · Expires ${data.expiresAt}`;
   } catch (err) {
@@ -128,6 +134,7 @@ $('tokenBtn').addEventListener('click', async () => {
 document.querySelectorAll('[data-plan]').forEach((btn) => {
   btn.addEventListener('click', async () => {
     const plan = btn.dataset.plan;
+
     $('account').scrollIntoView({ behavior: 'smooth' });
 
     if (plan === 'free') {
@@ -149,6 +156,6 @@ document.querySelectorAll('[data-plan]').forEach((btn) => {
     const data = await api('/api/account');
     showDashboard(data);
   } catch {
-    // No existing session.
+    // No active session.
   }
 })();
